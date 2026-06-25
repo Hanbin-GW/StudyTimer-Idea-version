@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-공부 타이머 v3
-- 키오스크 모드 (Dock, 메뉴바 숨김, 단축키 차단)
+공부 타이머 — macOS 전용
+- 키오스크 모드 (pyobjc)
 - 크롬 외 모든 앱 강제 종료
 - 크롬 탭 차단 (허용 사이트 외)
-- 비상 해제 (비밀번호)
+- 일시정지: 비밀번호 입력 → 타이머 정지 + 차단 해제
+- 초기화: 비밀번호 입력 → 타이머 리셋 (차단 유지)
 - SHA-256 비밀번호 해싱
-- 이모티콘 없음
 """
 
 import tkinter as tk
@@ -14,13 +14,18 @@ import threading
 import subprocess
 import hashlib
 import json
-import os
-import time
+import sys
+import platform
 from pathlib import Path
 
-# pyobjc -- 키오스크 모드용
+if platform.system() != "Darwin":
+    print("이 파일은 macOS 전용입니다. study_timer_windows.py 를 사용하세요.")
+    sys.exit(1)
+
+# pyobjc
+PYOBJC_AVAILABLE = False
 try:
-    from AppKit import NSApplication, NSApp
+    from AppKit import NSApp
     from AppKit import (
         NSApplicationPresentationHideDock,
         NSApplicationPresentationHideMenuBar,
@@ -31,10 +36,10 @@ try:
     )
     PYOBJC_AVAILABLE = True
 except ImportError:
-    PYOBJC_AVAILABLE = False
+    pass
 
 # ══════════════════════════════════════════════════════════════
-# 설정 관리
+# 상수
 # ══════════════════════════════════════════════════════════════
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
@@ -51,32 +56,23 @@ DEFAULT_SITES = [
 
 DEFAULT_PW_HASH = hashlib.sha256("1234".encode()).hexdigest()
 
-# 시스템 필수 프로세스 -- 절대 건드리면 안 됨
 SYSTEM_PROCESSES = {
-    "loginwindow",
-    "WindowServer",
-    "Dock",
-    "SystemUIServer",
-    "ControlCenter",
-    "NotificationCenter",
-    "Spotlight",
-    "universalaccessd",
-    "coreaudiod",
-    "AirPlayUIAgent",
-    "UserNotificationCenter",
-    "study_timer",   # 자기 자신
-    "Python",
-    "python3",
-    "osascript",
+    "loginwindow", "WindowServer", "Dock", "SystemUIServer",
+    "ControlCenter", "NotificationCenter", "Spotlight",
+    "universalaccessd", "coreaudiod", "AirPlayUIAgent",
+    "UserNotificationCenter", "Python", "python3", "osascript",
 }
 
-# 허용 앱 -- 타이머 중 종료하지 않는 앱
 ALLOWED_APPS = {
     "Google Chrome",
-    "Terminal",        # macOS 기본 터미널
-    "iTerm2",          # 터미널 대용 (있으면 허용)
+    "Terminal",
+    "iTerm2",
 } | SYSTEM_PROCESSES
 
+
+# ══════════════════════════════════════════════════════════════
+# 설정 관리
+# ══════════════════════════════════════════════════════════════
 
 class ConfigManager:
 
@@ -99,12 +95,7 @@ class ConfigManager:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
     def check_password(self, raw: str) -> bool:
-        hashed = hashlib.sha256(raw.encode()).hexdigest()
-        return hashed == self.data["password_hash"]
-
-    def set_password(self, raw: str):
-        self.data["password_hash"] = hashlib.sha256(raw.encode()).hexdigest()
-        self._save(self.data)
+        return hashlib.sha256(raw.encode()).hexdigest() == self.data["password_hash"]
 
     @property
     def allowed_sites(self) -> list[str]:
@@ -127,65 +118,36 @@ class ConfigManager:
 # ══════════════════════════════════════════════════════════════
 
 class KioskMode:
-    """
-    pyobjc를 통해 macOS NSApplication 프레젠테이션 옵션을 제어.
-
-    프레젠테이션 옵션 = macOS가 UI 요소를 얼마나 숨길지 결정하는 플래그.
-    비트 OR(|)로 여러 옵션을 조합.
-
-    pyobjc 없으면 AppleScript 방식으로 폴백.
-    """
 
     def enable(self):
         if PYOBJC_AVAILABLE:
-            self._enable_pyobjc()
+            options = (
+                NSApplicationPresentationHideDock                |
+                NSApplicationPresentationHideMenuBar             |
+                NSApplicationPresentationDisableAppleMenu        |
+                NSApplicationPresentationDisableProcessSwitching |
+                NSApplicationPresentationDisableForceQuit        |
+                NSApplicationPresentationDisableSessionTermination
+            )
+            NSApp.setPresentationOptions_(options)
         else:
-            self._enable_applescript()
+            subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to tell dock preferences'
+                 ' to set autohide to true'],
+                capture_output=True, timeout=5
+            )
 
     def disable(self):
         if PYOBJC_AVAILABLE:
-            self._disable_pyobjc()
+            NSApp.setPresentationOptions_(0)
         else:
-            self._disable_applescript()
-
-    def _enable_pyobjc(self):
-        options = (
-            NSApplicationPresentationHideDock |
-            NSApplicationPresentationHideMenuBar |
-            NSApplicationPresentationDisableAppleMenu |
-            NSApplicationPresentationDisableProcessSwitching |
-            NSApplicationPresentationDisableForceQuit |
-            NSApplicationPresentationDisableSessionTermination
-        )
-        NSApp.setPresentationOptions_(options)
-
-    def _disable_pyobjc(self):
-        # 0 = 기본값 (모든 제한 해제)
-        NSApp.setPresentationOptions_(0)
-
-    def _enable_applescript(self):
-        # pyobjc 없을 때 AppleScript로 일부 제한
-        # Dock 자동숨기기 + 메뉴바 자동숨기기
-        script = """
-        tell application "System Events"
-            tell dock preferences
-                set autohide to true
-            end tell
-        end tell
-        """
-        subprocess.run(["osascript", "-e", script],
-                       capture_output=True, timeout=5)
-
-    def _disable_applescript(self):
-        script = """
-        tell application "System Events"
-            tell dock preferences
-                set autohide to false
-            end tell
-        end tell
-        """
-        subprocess.run(["osascript", "-e", script],
-                       capture_output=True, timeout=5)
+            subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to tell dock preferences'
+                 ' to set autohide to false'],
+                capture_output=True, timeout=5
+            )
 
 
 # ══════════════════════════════════════════════════════════════
@@ -193,10 +155,6 @@ class KioskMode:
 # ══════════════════════════════════════════════════════════════
 
 class AppBlocker:
-    """
-    3초마다 실행 중인 GUI 앱 목록을 확인하고
-    ALLOWED_APPS 외의 앱을 강제 종료.
-    """
 
     POLL_INTERVAL = 3
 
@@ -205,57 +163,38 @@ class AppBlocker:
         self._thread: threading.Thread | None = None
 
     def _get_running_apps(self) -> list[str]:
-        """
-        현재 화면에 보이는 앱 목록 반환.
-        background only is false = GUI 앱만 (시스템 데몬 제외)
-        """
         script = """
             tell application "System Events"
                 get name of every process whose background only is false
             end tell
         """
         try:
-            result = subprocess.run(
+            r = subprocess.run(
                 ["osascript", "-e", script],
                 capture_output=True, text=True, timeout=5
             )
-            if result.returncode != 0:
+            if r.returncode != 0 or not r.stdout.strip():
                 return []
-            raw = result.stdout.strip()
-            if not raw:
-                return []
-            return [a.strip() for a in raw.split(",")]
+            return [a.strip() for a in r.stdout.strip().split(",")]
         except Exception:
             return []
 
     def _kill_app(self, app_name: str):
-        """
-        앱 강제 종료.
-        1차: AppleScript quit (정상 종료)
-        2차: killall -9 (강제)
-        """
-        try:
-            result = subprocess.run(
-                ["osascript", "-e", f'tell application "{app_name}" to quit'],
-                capture_output=True, text=True, timeout=3
-            )
-            if result.returncode == 0:
-                return
-        except Exception:
-            pass
-
         try:
             subprocess.run(
-                ["killall", "-9", app_name],
-                capture_output=True, text=True
+                ["osascript", "-e", f'tell application "{app_name}" to quit'],
+                capture_output=True, timeout=3
             )
+        except Exception:
+            pass
+        try:
+            subprocess.run(["killall", "-9", app_name], capture_output=True)
         except Exception:
             pass
 
     def _loop(self):
         while not self._stop_event.is_set():
-            apps = self._get_running_apps()
-            for app in apps:
+            for app in self._get_running_apps():
                 if app not in ALLOWED_APPS:
                     self._kill_app(app)
             self._stop_event.wait(self.POLL_INTERVAL)
@@ -279,7 +218,7 @@ class ChromeBlocker:
 
     POLL_INTERVAL = 5
 
-    APPLESCRIPT_TEMPLATE = """
+    SCRIPT_TEMPLATE = """
 tell application "Google Chrome"
     set allowedDomains to {domains}
     set tabsToClose to {{}}
@@ -309,16 +248,13 @@ end tell
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
-    def _build_script(self) -> str:
+    def _run_once(self):
         domains_as = "{" + ", ".join(
             f'"{d}"' for d in self.config.allowed_sites
         ) + "}"
-        return self.APPLESCRIPT_TEMPLATE.format(domains=domains_as)
-
-    def _run_once(self):
         try:
             subprocess.run(
-                ["osascript", "-e", self._build_script()],
+                ["osascript", "-e", self.SCRIPT_TEMPLATE.format(domains=domains_as)],
                 capture_output=True, text=True, timeout=8
             )
         except Exception:
@@ -375,8 +311,8 @@ class PasswordDialog(tk.Toplevel):
         )
         self._entry.pack(ipady=6)
         self._entry.focus_set()
-        self._entry.bind("<Return>",  lambda e: self._confirm())
-        self._entry.bind("<Escape>",  lambda e: self._cancel())
+        self._entry.bind("<Return>", lambda e: self._confirm())
+        self._entry.bind("<Escape>", lambda e: self._cancel())
 
         btn_row = tk.Frame(self, bg="#0D0D0D")
         btn_row.pack(pady=12)
@@ -428,7 +364,6 @@ class SiteManagerDialog(tk.Toplevel):
         px = parent.winfo_x() + (parent.winfo_width()  - W) // 2
         py = parent.winfo_y() + (parent.winfo_height() - H) // 2
         self.geometry(f"{W}x{H}+{px}+{py}")
-
         self._build_ui()
         self.wait_window(self)
 
@@ -448,8 +383,8 @@ class SiteManagerDialog(tk.Toplevel):
         list_frame = tk.Frame(self, bg="#161616")
         list_frame.pack(fill="both", expand=True, padx=20, pady=10)
 
-        scrollbar = tk.Scrollbar(list_frame)
-        scrollbar.pack(side="right", fill="y")
+        sb = tk.Scrollbar(list_frame)
+        sb.pack(side="right", fill="y")
 
         self._listbox = tk.Listbox(
             list_frame,
@@ -459,10 +394,10 @@ class SiteManagerDialog(tk.Toplevel):
             font=("Courier New", 10),
             relief="flat", bd=0,
             activestyle="none",
-            yscrollcommand=scrollbar.set,
+            yscrollcommand=sb.set,
         )
         self._listbox.pack(fill="both", expand=True, padx=8, pady=8)
-        scrollbar.config(command=self._listbox.yview)
+        sb.config(command=self._listbox.yview)
         self._refresh_list()
 
         add_frame = tk.Frame(self, bg="#0D0D0D")
@@ -472,12 +407,11 @@ class SiteManagerDialog(tk.Toplevel):
             add_frame,
             bg="#1A1A1A", fg="#EEEEEE",
             insertbackground="#4AE3A0",
-            relief="flat",
-            font=("Courier New", 10),
+            relief="flat", font=("Courier New", 10),
         )
         self._entry.pack(side="left", fill="x", expand=True, ipady=6, padx=(0, 8))
         self._entry.insert(0, "예: notion.so")
-        self._entry.bind("<FocusIn>", lambda e: self._clear_placeholder())
+        self._entry.bind("<FocusIn>", lambda e: self._clear_ph())
         self._entry.bind("<Return>",  lambda e: self._add_site())
 
         tk.Button(
@@ -515,7 +449,7 @@ class SiteManagerDialog(tk.Toplevel):
         for site in self.config.allowed_sites:
             self._listbox.insert(tk.END, f"  {site}")
 
-    def _clear_placeholder(self):
+    def _clear_ph(self):
         if self._entry.get() == "예: notion.so":
             self._entry.delete(0, tk.END)
 
@@ -530,8 +464,7 @@ class SiteManagerDialog(tk.Toplevel):
         sel = self._listbox.curselection()
         if not sel:
             return
-        site = self.config.allowed_sites[sel[0]]
-        self.config.remove_site(site)
+        self.config.remove_site(self.config.allowed_sites[sel[0]])
         self._refresh_list()
 
 
@@ -578,19 +511,18 @@ class FinishDialog(tk.Toplevel):
             self, text="컴퓨터 재부팅",
             bg="#0D0D0D", fg="#FF5C5C",
             font=("Courier New", 9),
-            relief="flat", cursor="hand2",
-            pady=5,
-            command=self._confirm_reboot,
+            relief="flat", cursor="hand2", pady=5,
+            command=self._reboot,
         ).pack()
 
         self.wait_window(self)
 
-    def _confirm_reboot(self):
+    def _reboot(self):
         self.destroy()
         subprocess.run(
             ["osascript", "-e",
              'tell application "System Events" to restart'],
-            capture_output=True,
+            capture_output=True
         )
 
 
@@ -614,7 +546,7 @@ class StudyTimerApp:
         self.root.configure(bg=self.C_BG)
         self.root.resizable(False, False)
 
-        W, H = 460, 580
+        W, H = 460, 560
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         root.geometry(f"{W}x{H}+{(sw-W)//2}+{(sh-H)//2}")
 
@@ -626,10 +558,9 @@ class StudyTimerApp:
         self.remaining = 0
         self.total     = 0
         self.running   = False
-
         self._stop_event = threading.Event()
 
-        # Cmd+Q 차단 -- 타이머 실행 중 앱 강제 종료 방지
+        # Cmd+Q 차단 (타이머 실행 중)
         self.root.createcommand("tk::mac::Quit", self._intercept_quit)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -638,12 +569,11 @@ class StudyTimerApp:
     # ── UI ────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # 헤더
         hdr = tk.Frame(self.root, bg=self.C_BG)
         hdr.pack(fill="x", padx=32, pady=(26, 0))
 
         tk.Label(
-            hdr, text="FOCUS",
+            hdr, text="FOCUS  macOS",
             bg=self.C_BG, fg=self.C_ACCENT,
             font=("Courier New", 10, "bold"),
         ).pack(side="left")
@@ -656,7 +586,6 @@ class StudyTimerApp:
             command=self._open_site_manager,
         ).pack(side="right")
 
-        # 타이머 카드
         card = tk.Frame(self.root, bg=self.C_CARD)
         card.pack(fill="x", padx=32, pady=(14, 0))
 
@@ -677,7 +606,6 @@ class StudyTimerApp:
         )
         self.bar.bind("<Configure>", lambda e: self._redraw_bar())
 
-        # 상태
         self.lbl_status = tk.Label(
             self.root, text="대기 중",
             bg=self.C_BG, fg=self.C_SUB,
@@ -685,16 +613,9 @@ class StudyTimerApp:
         )
         self.lbl_status.pack(pady=(10, 0))
 
-        # 시간 입력
         self._build_time_inputs()
-
-        # 프리셋
         self._build_presets()
-
-        # 버튼
         self._build_controls()
-
-        # 허용 사이트 미리보기
         self._build_site_preview()
 
     def _build_time_inputs(self):
@@ -754,37 +675,41 @@ class StudyTimerApp:
         frm = tk.Frame(self.root, bg=self.C_BG)
         frm.pack(fill="x", padx=32, pady=(20, 0))
 
+        # 시작 버튼
         self.btn_start = tk.Button(
             frm, text="시작",
             bg=self.C_ACCENT, fg="#000",
             relief="flat", cursor="hand2",
             font=("Courier New", 12, "bold"),
             pady=12,
-            command=self._toggle,
+            command=self._start,
         )
         self.btn_start.pack(fill="x")
 
         btn_row = tk.Frame(frm, bg=self.C_BG)
         btn_row.pack(fill="x", pady=(7, 0))
 
-        self.btn_emergency = tk.Button(
-            btn_row, text="비상 해제",
-            bg=self.C_DIM, fg=self.C_WARN,
+        # 일시정지 — 비밀번호 입력 후 타이머 정지 + 차단 해제
+        self.btn_pause = tk.Button(
+            btn_row, text="일시정지",
+            bg=self.C_DIM, fg=self.C_TEXT,
             relief="flat", cursor="hand2",
-            font=("Courier New", 9),
-            pady=8,
-            command=self._emergency_unlock,
+            font=("Courier New", 9), pady=8,
+            state="disabled",
+            command=self._request_pause,
         )
-        self.btn_emergency.pack(side="left", expand=True, fill="x", padx=(0, 6))
+        self.btn_pause.pack(side="left", expand=True, fill="x", padx=(0, 6))
 
-        tk.Button(
+        # 초기화 — 비밀번호 입력 후 타이머 리셋 (차단 유지)
+        self.btn_reset = tk.Button(
             btn_row, text="초기화",
             bg=self.C_DIM, fg=self.C_SUB,
             relief="flat", cursor="hand2",
-            font=("Courier New", 9),
-            pady=8,
-            command=self._reset,
-        ).pack(side="left", expand=True, fill="x")
+            font=("Courier New", 9), pady=8,
+            state="disabled",
+            command=self._request_reset,
+        )
+        self.btn_reset.pack(side="left", expand=True, fill="x")
 
     def _build_site_preview(self):
         frm = tk.Frame(self.root, bg=self.C_BG)
@@ -816,12 +741,6 @@ class StudyTimerApp:
             self.var_m.set(m)
             self.var_s.set(0)
 
-    def _toggle(self):
-        if self.running:
-            self._pause()
-        else:
-            self._start()
-
     def _start(self):
         if self.remaining == 0:
             total = (self.var_h.get() * 3600
@@ -836,12 +755,15 @@ class StudyTimerApp:
         self.running = True
         self._stop_event.clear()
 
-        # 키오스크 + 앱 차단 + 탭 차단 동시 시작
         self.kiosk.enable()
-        self.app_blocker.start()
-        self.chrome_block.start()
+        if not self.app_blocker._thread or not self.app_blocker._thread.is_alive():
+            self.app_blocker.start()
+        if not self.chrome_block._thread or not self.chrome_block._thread.is_alive():
+            self.chrome_block.start()
 
-        self.btn_start.config(text="일시정지", bg=self.C_DIM, fg=self.C_TEXT)
+        self.btn_start.config(state="disabled", bg=self.C_DIM, fg=self.C_SUB)
+        self.btn_pause.config(state="normal",   fg=self.C_TEXT)
+        self.btn_reset.config(state="normal")
         self.lbl_status.config(
             text="집중 중  |  앱 차단 + 탭 차단 활성화",
             fg=self.C_ACCENT,
@@ -851,26 +773,50 @@ class StudyTimerApp:
             target=self._countdown, daemon=True, name="Countdown"
         ).start()
 
-    def _pause(self):
+    def _do_pause(self):
+        """실제 일시정지 — 차단 해제"""
         self.running = False
         self._stop_event.set()
-
-        # 모든 차단 해제
         self.kiosk.disable()
         self.app_blocker.stop()
         self.chrome_block.stop()
+        self.btn_start.config(state="normal", text="재개", bg=self.C_ACCENT, fg="#000")
+        self.btn_pause.config(state="disabled")
+        self.btn_reset.config(state="normal")
+        self.lbl_status.config(text="일시정지  |  차단 해제됨", fg=self.C_SUB)
 
-        self.btn_start.config(text="재개", bg=self.C_ACCENT, fg="#000")
-        self.lbl_status.config(text="일시정지", fg=self.C_SUB)
-
-    def _reset(self):
-        self._pause()
+    def _do_reset(self):
+        """실제 초기화 — 타이머만 리셋, 차단 유지"""
+        self._stop_event.set()
+        self.running   = False
         self.remaining = 0
         self.total     = 0
         self.lbl_time.config(text="00:00:00", fg=self.C_TEXT)
-        self.btn_start.config(text="시작", bg=self.C_ACCENT, fg="#000")
-        self.lbl_status.config(text="대기 중", fg=self.C_SUB)
+        self.btn_start.config(state="normal", text="시작", bg=self.C_ACCENT, fg="#000")
+        self.btn_pause.config(state="disabled")
+        self.btn_reset.config(state="disabled")
+        self.lbl_status.config(text="대기 중  |  차단 유지 중", fg=self.C_SUB)
         self._redraw_bar()
+
+    def _request_pause(self):
+        """일시정지 — 비밀번호 확인 후 실행"""
+        dlg = PasswordDialog(self.root, title="일시정지", prompt="비밀번호를 입력하세요:")
+        if dlg.result is None:
+            return
+        if self.config.check_password(dlg.result):
+            self._do_pause()
+        else:
+            self._flash("비밀번호가 틀렸습니다", error=True)
+
+    def _request_reset(self):
+        """초기화 — 비밀번호 확인 후 실행 (차단 유지)"""
+        dlg = PasswordDialog(self.root, title="초기화", prompt="비밀번호를 입력하세요:")
+        if dlg.result is None:
+            return
+        if self.config.check_password(dlg.result):
+            self._do_reset()
+        else:
+            self._flash("비밀번호가 틀렸습니다", error=True)
 
     def _countdown(self):
         while self.remaining > 0 and not self._stop_event.is_set():
@@ -878,7 +824,6 @@ class StudyTimerApp:
             self._stop_event.wait(1)
             if not self._stop_event.is_set():
                 self.remaining -= 1
-
         if not self._stop_event.is_set() and self.remaining <= 0:
             self.remaining = 0
             self.root.after(0, self._on_finish)
@@ -897,14 +842,13 @@ class StudyTimerApp:
 
     def _on_finish(self):
         self.running = False
-
-        # 타이머 종료 시 모든 제한 해제
         self.kiosk.disable()
         self.app_blocker.stop()
         self.chrome_block.stop()
-
         self.lbl_time.config(fg=self.C_ACCENT)
-        self.btn_start.config(text="시작", bg=self.C_ACCENT, fg="#000")
+        self.btn_start.config(state="normal", text="시작", bg=self.C_ACCENT, fg="#000")
+        self.btn_pause.config(state="disabled")
+        self.btn_reset.config(state="disabled")
         self.lbl_status.config(text="완료", fg=self.C_ACCENT)
         self._notify()
         FinishDialog(self.root)
@@ -915,26 +859,10 @@ class StudyTimerApp:
                 ["osascript", "-e",
                  'display notification "공부 완료" '
                  'with title "FOCUS Timer" sound name "Glass"'],
-                capture_output=True, timeout=3,
+                capture_output=True, timeout=3
             )
         except Exception:
             pass
-
-    # ── 비상 해제 ─────────────────────────────────────────────
-
-    def _emergency_unlock(self):
-        dlg = PasswordDialog(self.root, title="비상 해제", prompt="비상 해제 비밀번호:")
-        if dlg.result is None:
-            return
-        if self.config.check_password(dlg.result):
-            self._pause()
-            self.lbl_status.config(
-                text="비상 해제 -- 모든 차단 비활성화", fg=self.C_WARN
-            )
-        else:
-            self._flash("비밀번호가 틀렸습니다", error=True)
-
-    # ── 사이트 관리 ───────────────────────────────────────────
 
     def _open_site_manager(self):
         dlg = PasswordDialog(self.root, title="사이트 관리", prompt="관리자 비밀번호:")
@@ -946,13 +874,7 @@ class StudyTimerApp:
         else:
             self._flash("비밀번호가 틀렸습니다", error=True)
 
-    # ── Cmd+Q 차단 ────────────────────────────────────────────
-
     def _intercept_quit(self):
-        """
-        타이머 실행 중 Cmd+Q 차단.
-        실행 중이 아닐 때는 정상 종료 허용.
-        """
         if self.running:
             self._flash("타이머 실행 중에는 종료할 수 없습니다", error=True)
         else:
@@ -964,8 +886,6 @@ class StudyTimerApp:
         self.app_blocker.stop()
         self.chrome_block.stop()
         self.root.destroy()
-
-    # ── 유틸 ──────────────────────────────────────────────────
 
     def _flash(self, msg: str, error: bool = False):
         color = self.C_WARN if error else self.C_ACCENT

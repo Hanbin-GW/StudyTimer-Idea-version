@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-공부 타이머 v4 — macOS + Windows 크로스플랫폼
-- 키오스크 모드
-- 크롬 외 모든 앱 강제 종료
-- 크롬 탭 차단 (허용 사이트 외)
-- 비상 해제 (비밀번호 / SHA-256)
-- Windows: 크롬 바로가기 자동 수정 (CDP 포트 9222)
+공부 타이머 — Windows 전용
+- 키오스크 모드 (작업표시줄 숨김 + Win키 차단)
+- 크롬 외 모든 앱 강제 종료 (taskkill)
+- 크롬 탭 차단 — CDP 포트 9222 (허용 사이트 외)
+- 일시정지: 비밀번호 입력 → 타이머 정지 + 차단 해제
+- 초기화: 비밀번호 입력 → 타이머 리셋 (차단 유지)
+- SHA-256 비밀번호 해싱
+- 첫 실행 시 크롬 바로가기 자동 수정 (CDP 포트)
 """
 
 import tkinter as tk
@@ -15,63 +17,28 @@ import hashlib
 import json
 import os
 import sys
-import time
 import platform
 from pathlib import Path
 
-# ══════════════════════════════════════════════════════════════
-# OS 감지
-# ══════════════════════════════════════════════════════════════
-#
-# platform.system() 반환값:
-#   "Darwin"  → macOS
-#   "Windows" → Windows
-#   "Linux"   → Linux (미지원, 안내 메시지)
+if platform.system() != "Windows":
+    print("이 파일은 Windows 전용입니다. study_timer_mac.py 를 사용하세요.")
+    sys.exit(1)
 
-OS = platform.system()  # "Darwin" | "Windows" | "Linux"
-IS_MAC = (OS == "Darwin")
-IS_WIN = (OS == "Windows")
+import ctypes
+import ctypes.wintypes
 
-# ══════════════════════════════════════════════════════════════
-# OS별 라이브러리 임포트
-# ══════════════════════════════════════════════════════════════
+try:
+    import winreg
+    WINREG_AVAILABLE = True
+except ImportError:
+    WINREG_AVAILABLE = False
 
-# macOS: pyobjc (키오스크 모드)
-PYOBJC_AVAILABLE = False
-if IS_MAC:
-    try:
-        from AppKit import NSApp
-        from AppKit import (
-            NSApplicationPresentationHideDock,
-            NSApplicationPresentationHideMenuBar,
-            NSApplicationPresentationDisableAppleMenu,
-            NSApplicationPresentationDisableProcessSwitching,
-            NSApplicationPresentationDisableForceQuit,
-            NSApplicationPresentationDisableSessionTermination,
-        )
-        PYOBJC_AVAILABLE = True
-    except ImportError:
-        pass
-
-# Windows: pywin32 (키오스크 모드 / 프로세스 제어)
-PYWIN32_AVAILABLE = False
-if IS_WIN:
-    try:
-        import ctypes
-        import ctypes.wintypes
-        import winreg
-        PYWIN32_AVAILABLE = True
-    except ImportError:
-        pass
-
-# Windows: requests (CDP 통신)
 REQUESTS_AVAILABLE = False
-if IS_WIN:
-    try:
-        import requests as req_lib
-        REQUESTS_AVAILABLE = True
-    except ImportError:
-        pass
+try:
+    import requests as req_lib
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    pass
 
 # ══════════════════════════════════════════════════════════════
 # 상수
@@ -91,55 +58,22 @@ DEFAULT_SITES = [
 
 DEFAULT_PW_HASH = hashlib.sha256("1234".encode()).hexdigest()
 
-# macOS 시스템 필수 프로세스
-MAC_SYSTEM_PROCESSES = {
-    "loginwindow", "WindowServer", "Dock", "SystemUIServer",
-    "ControlCenter", "NotificationCenter", "Spotlight",
-    "universalaccessd", "coreaudiod", "AirPlayUIAgent",
-    "UserNotificationCenter", "Python", "python3", "osascript",
-}
-
-# Windows 시스템 필수 프로세스 (종료하면 블루스크린/재부팅)
 WIN_SYSTEM_PROCESSES = {
-    "explorer.exe",       # Windows 탐색기 (macOS Finder 역할)
-    "python.exe",         # 자기 자신
-    "python3.exe",
-    "pythonw.exe",
-    "cmd.exe",            # 터미널
-    "powershell.exe",
-    "WindowsTerminal.exe",
-    "conhost.exe",
-    "csrss.exe",          # 클라이언트/서버 런타임
-    "wininit.exe",
-    "winlogon.exe",
-    "services.exe",
-    "lsass.exe",          # 로컬 보안 인증
-    "svchost.exe",
-    "dwm.exe",            # 데스크탑 창 관리자
-    "taskmgr.exe",
-    "SearchUI.exe",
-    "ShellExperienceHost.exe",
-    "StartMenuExperienceHost.exe",
-    "RuntimeBroker.exe",
-    "sihost.exe",
-    "ctfmon.exe",
-    "fontdrvhost.exe",
-    "spoolsv.exe",
+    "explorer.exe", "python.exe", "python3.exe", "pythonw.exe",
+    "cmd.exe", "powershell.exe", "windowsterminal.exe", "conhost.exe",
+    "csrss.exe", "wininit.exe", "winlogon.exe", "services.exe",
+    "lsass.exe", "svchost.exe", "dwm.exe", "taskmgr.exe",
+    "searchui.exe", "shellexperiencehost.exe",
+    "startmenuexperiencehost.exe", "runtimebroker.exe",
+    "sihost.exe", "ctfmon.exe", "fontdrvhost.exe", "spoolsv.exe",
+    "securityhealthsystray.exe", "securityhealthservice.exe",
+    "textinputhost.exe", "searchapp.exe", "lockapp.exe",
 }
 
-# macOS 허용 앱
-MAC_ALLOWED_APPS = {
-    "Google Chrome",
-    "Terminal",
-    "iTerm2",
-} | MAC_SYSTEM_PROCESSES
-
-# Windows 허용 프로세스
 WIN_ALLOWED_PROCS = {
     "chrome.exe",
 } | WIN_SYSTEM_PROCESSES
 
-# CDP 포트 (Chrome DevTools Protocol)
 CDP_PORT = 9222
 
 
@@ -170,10 +104,6 @@ class ConfigManager:
     def check_password(self, raw: str) -> bool:
         return hashlib.sha256(raw.encode()).hexdigest() == self.data["password_hash"]
 
-    def set_password(self, raw: str):
-        self.data["password_hash"] = hashlib.sha256(raw.encode()).hexdigest()
-        self._save(self.data)
-
     @property
     def allowed_sites(self) -> list[str]:
         return self.data["allowed_sites"]
@@ -191,123 +121,40 @@ class ConfigManager:
 
 
 # ══════════════════════════════════════════════════════════════
-# 키오스크 모드 (OS별)
+# 키오스크 모드
 # ══════════════════════════════════════════════════════════════
 
 class KioskMode:
-    """
-    macOS: pyobjc NSApp.setPresentationOptions_()
-    Windows: pywin32으로 작업표시줄 숨김 + Alt+Tab 차단
-
-    Windows 키오스크 방식:
-      SetWindowsHookEx(WH_KEYBOARD_LL) → 키보드 훅
-      → Win키, Alt+Tab, Ctrl+Esc 등을 가로채서 무효화
-      SetWindowsHookEx는 ctypes로 직접 Windows API 호출
-    """
 
     def __init__(self):
-        self._win_hook = None      # Windows 키보드 훅 핸들
-        self._taskbar_hwnd = None  # 작업표시줄 창 핸들
+        self._taskbar_hwnd = None
+        self._win_hook     = None
+        self._hook_proc    = None
 
     def enable(self):
-        if IS_MAC:
-            self._mac_enable()
-        elif IS_WIN:
-            self._win_enable()
+        self._hide_taskbar()
+        self._install_keyboard_hook()
 
     def disable(self):
-        if IS_MAC:
-            self._mac_disable()
-        elif IS_WIN:
-            self._win_disable()
+        self._show_taskbar()
+        self._remove_keyboard_hook()
 
-    # ── macOS ──────────────────────────────────────────────────
-
-    def _mac_enable(self):
-        if PYOBJC_AVAILABLE:
-            options = (
-                NSApplicationPresentationHideDock               |
-                NSApplicationPresentationHideMenuBar            |
-                NSApplicationPresentationDisableAppleMenu       |
-                NSApplicationPresentationDisableProcessSwitching|
-                NSApplicationPresentationDisableForceQuit       |
-                NSApplicationPresentationDisableSessionTermination
-            )
-            NSApp.setPresentationOptions_(options)
-        else:
-            # pyobjc 없으면 AppleScript 폴백
-            subprocess.run(
-                ["osascript", "-e",
-                 'tell application "System Events" to tell dock preferences'
-                 ' to set autohide to true'],
-                capture_output=True, timeout=5
-            )
-
-    def _mac_disable(self):
-        if PYOBJC_AVAILABLE:
-            NSApp.setPresentationOptions_(0)
-        else:
-            subprocess.run(
-                ["osascript", "-e",
-                 'tell application "System Events" to tell dock preferences'
-                 ' to set autohide to false'],
-                capture_output=True, timeout=5
-            )
-
-    # ── Windows ────────────────────────────────────────────────
-
-    def _win_enable(self):
-        if not PYWIN32_AVAILABLE:
-            return
-
-        # 작업표시줄 숨기기
-        # FindWindow로 작업표시줄 창 핸들 찾기
-        # SW_HIDE(0) = 숨김
+    def _hide_taskbar(self):
         user32 = ctypes.windll.user32
         self._taskbar_hwnd = user32.FindWindowW("Shell_TrayWnd", None)
         if self._taskbar_hwnd:
-            user32.ShowWindow(self._taskbar_hwnd, 0)  # 0 = SW_HIDE
+            user32.ShowWindow(self._taskbar_hwnd, 0)  # SW_HIDE
 
-        # 저수준 키보드 훅 설치
-        # WH_KEYBOARD_LL(13) = 모든 키 입력을 가로채는 훅
-        # Win키, Alt+Tab, Ctrl+Esc 등을 무효화
-        self._install_keyboard_hook()
-
-    def _win_disable(self):
-        if not PYWIN32_AVAILABLE:
-            return
-
-        # 작업표시줄 다시 표시
-        # SW_SHOW(5) = 보이기
+    def _show_taskbar(self):
         if self._taskbar_hwnd:
-            ctypes.windll.user32.ShowWindow(self._taskbar_hwnd, 5)
-
-        # 키보드 훅 제거
-        if self._win_hook:
-            ctypes.windll.user32.UnhookWindowsHookEx(self._win_hook)
-            self._win_hook = None
+            ctypes.windll.user32.ShowWindow(self._taskbar_hwnd, 5)  # SW_SHOW
 
     def _install_keyboard_hook(self):
-        """
-        Windows 저수준 키보드 훅.
-        특정 키 조합을 가로채서 무효화.
-
-        HOOKPROC 콜백 함수:
-          nCode < 0    → 다음 훅으로 넘기기 (건드리면 안 됨)
-          nCode >= 0   → 키 처리 여부 결정
-
-        차단할 키:
-          VK_LWIN(0x5B), VK_RWIN(0x5C) → Windows 키
-          VK_TAB(0x09) + Alt             → Alt+Tab
-          VK_ESCAPE(0x1B) + Ctrl         → Ctrl+Esc (시작 메뉴)
-        """
-        BLOCK_KEYS = {0x5B, 0x5C}  # LWin, RWin
-
+        BLOCK_KEYS    = {0x5B, 0x5C}  # LWin, RWin
         WH_KEYBOARD_LL = 13
-        WM_KEYDOWN     = 0x0100
-        WM_SYSKEYDOWN  = 0x0104
+        WM_KEYDOWN    = 0x0100
+        WM_SYSKEYDOWN = 0x0104
 
-        # KBDLLHOOKSTRUCT 구조체
         class KBDLLHOOKSTRUCT(ctypes.Structure):
             _fields_ = [
                 ("vkCode",      ctypes.wintypes.DWORD),
@@ -324,31 +171,32 @@ class KioskMode:
 
         def hook_callback(nCode, wParam, lParam):
             if nCode >= 0 and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                kb = ctypes.cast(
+                    lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)
+                ).contents
                 if kb.vkCode in BLOCK_KEYS:
-                    return 1  # 1 반환 = 이 키 입력 차단
-            # 차단하지 않으면 다음 훅으로 전달
+                    return 1
             return ctypes.windll.user32.CallNextHookEx(
                 self._win_hook, nCode, wParam, lParam
             )
 
         self._hook_proc = HOOKPROC(hook_callback)
         self._win_hook  = ctypes.windll.user32.SetWindowsHookExW(
-            WH_KEYBOARD_LL,
-            self._hook_proc,
-            None, 0
+            WH_KEYBOARD_LL, self._hook_proc, None, 0
         )
+
+    def _remove_keyboard_hook(self):
+        if self._win_hook:
+            ctypes.windll.user32.UnhookWindowsHookEx(self._win_hook)
+            self._win_hook  = None
+            self._hook_proc = None
 
 
 # ══════════════════════════════════════════════════════════════
-# 앱 차단기 (OS별)
+# 앱 차단기
 # ══════════════════════════════════════════════════════════════
 
 class AppBlocker:
-    """
-    macOS: AppleScript로 GUI 앱 목록 가져와서 killall
-    Windows: tasklist.exe로 프로세스 목록 → taskkill /F
-    """
 
     POLL_INTERVAL = 3
 
@@ -356,56 +204,7 @@ class AppBlocker:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
-    # ── macOS ──────────────────────────────────────────────────
-
-    def _mac_get_apps(self) -> list[str]:
-        script = """
-            tell application "System Events"
-                get name of every process whose background only is false
-            end tell
-        """
-        try:
-            r = subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True, text=True, timeout=5
-            )
-            if r.returncode != 0 or not r.stdout.strip():
-                return []
-            return [a.strip() for a in r.stdout.strip().split(",")]
-        except Exception:
-            return []
-
-    def _mac_kill(self, app_name: str):
-        try:
-            subprocess.run(
-                ["osascript", "-e", f'tell application "{app_name}" to quit'],
-                capture_output=True, timeout=3
-            )
-        except Exception:
-            pass
-        try:
-            subprocess.run(["killall", "-9", app_name], capture_output=True)
-        except Exception:
-            pass
-
-    def _mac_loop(self):
-        while not self._stop_event.is_set():
-            for app in self._mac_get_apps():
-                if app not in MAC_ALLOWED_APPS:
-                    self._mac_kill(app)
-            self._stop_event.wait(self.POLL_INTERVAL)
-
-    # ── Windows ────────────────────────────────────────────────
-
-    def _win_get_procs(self) -> list[str]:
-        """
-        tasklist.exe /FO CSV → CSV 형태로 프로세스 목록 출력
-        "chrome.exe","1234","Console","1","50,000 K"
-        첫 번째 컬럼(이름)만 추출.
-
-        /FO CSV = 출력 형식을 CSV로
-        /NH     = 헤더 없음
-        """
+    def _get_procs(self) -> list[str]:
         try:
             r = subprocess.run(
                 ["tasklist", "/FO", "CSV", "/NH"],
@@ -416,19 +215,13 @@ class AppBlocker:
             for line in r.stdout.strip().splitlines():
                 line = line.strip()
                 if line:
-                    # "chrome.exe","1234",... → chrome.exe
                     name = line.split(",")[0].strip('"').lower()
                     procs.append(name)
             return procs
         except Exception:
             return []
 
-    def _win_kill(self, proc_name: str):
-        """
-        taskkill /F /IM <이름>
-        /F  = 강제 종료 (Force)
-        /IM = 이미지 이름으로 지정
-        """
+    def _kill(self, proc_name: str):
         try:
             subprocess.run(
                 ["taskkill", "/F", "/IM", proc_name],
@@ -438,20 +231,17 @@ class AppBlocker:
         except Exception:
             pass
 
-    def _win_loop(self):
+    def _loop(self):
         while not self._stop_event.is_set():
-            for proc in self._win_get_procs():
+            for proc in self._get_procs():
                 if proc not in WIN_ALLOWED_PROCS:
-                    self._win_kill(proc)
+                    self._kill(proc)
             self._stop_event.wait(self.POLL_INTERVAL)
-
-    # ── 공통 ───────────────────────────────────────────────────
 
     def start(self):
         self._stop_event.clear()
-        target = self._mac_loop if IS_MAC else self._win_loop
         self._thread = threading.Thread(
-            target=target, daemon=True, name="AppBlocker"
+            target=self._loop, daemon=True, name="AppBlocker"
         )
         self._thread.start()
 
@@ -460,98 +250,32 @@ class AppBlocker:
 
 
 # ══════════════════════════════════════════════════════════════
-# 크롬 탭 차단기 (OS별)
+# 크롬 탭 차단기 (CDP)
 # ══════════════════════════════════════════════════════════════
 
 class ChromeBlocker:
-    """
-    macOS: AppleScript로 크롬 탭 직접 제어
-    Windows: CDP(Chrome DevTools Protocol) HTTP API로 탭 제어
-             크롬이 --remote-debugging-port=9222 로 실행돼야 함
-    """
 
     POLL_INTERVAL = 5
-
-    MAC_SCRIPT_TEMPLATE = """
-tell application "Google Chrome"
-    set allowedDomains to {domains}
-    set tabsToClose to {{}}
-    repeat with w in every window
-        repeat with t in every tab of w
-            set tabURL to URL of t
-            set isAllowed to false
-            repeat with d in allowedDomains
-                if tabURL contains d then
-                    set isAllowed to true
-                    exit repeat
-                end if
-            end repeat
-            if not isAllowed then
-                set end of tabsToClose to t
-            end if
-        end repeat
-    end repeat
-    repeat with t in tabsToClose
-        close t
-    end repeat
-end tell
-"""
 
     def __init__(self, config: ConfigManager):
         self.config = config
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
-    # ── macOS ──────────────────────────────────────────────────
-
-    def _mac_run_once(self):
-        domains_as = "{" + ", ".join(
-            f'"{d}"' for d in self.config.allowed_sites
-        ) + "}"
-        script = self.MAC_SCRIPT_TEMPLATE.format(domains=domains_as)
-        try:
-            subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True, text=True, timeout=8
-            )
-        except Exception:
-            pass
-
-    def _mac_loop(self):
-        while not self._stop_event.is_set():
-            self._mac_run_once()
-            self._stop_event.wait(self.POLL_INTERVAL)
-
-    # ── Windows (CDP) ──────────────────────────────────────────
-
-    def _win_run_once(self):
-        """
-        CDP HTTP API 흐름:
-          GET http://localhost:9222/json
-            → 열린 탭 목록 (JSON 배열) 반환
-              [{"id": "abc", "url": "https://...", "type": "page"}, ...]
-
-          GET http://localhost:9222/json/close/{id}
-            → 해당 탭 닫기
-        """
+    def _run_once(self):
         if not REQUESTS_AVAILABLE:
             return
         try:
             tabs = req_lib.get(
-                f"http://localhost:{CDP_PORT}/json",
-                timeout=3
+                f"http://localhost:{CDP_PORT}/json", timeout=3
             ).json()
-
             for tab in tabs:
                 if tab.get("type") != "page":
                     continue
                 url = tab.get("url", "")
-                # 허용 사이트 포함 여부 확인
-                allowed = any(d in url for d in self.config.allowed_sites)
-                # 빈 탭, 새 탭 페이지는 허용
                 if not url or url in ("chrome://newtab/", "about:blank"):
-                    allowed = True
-                if not allowed:
+                    continue
+                if not any(d in url for d in self.config.allowed_sites):
                     tab_id = tab.get("id", "")
                     if tab_id:
                         req_lib.get(
@@ -561,18 +285,15 @@ end tell
         except Exception:
             pass
 
-    def _win_loop(self):
+    def _loop(self):
         while not self._stop_event.is_set():
-            self._win_run_once()
+            self._run_once()
             self._stop_event.wait(self.POLL_INTERVAL)
-
-    # ── 공통 ───────────────────────────────────────────────────
 
     def start(self):
         self._stop_event.clear()
-        target = self._mac_loop if IS_MAC else self._win_loop
         self._thread = threading.Thread(
-            target=target, daemon=True, name="ChromeBlocker"
+            target=self._loop, daemon=True, name="ChromeBlocker"
         )
         self._thread.start()
 
@@ -581,39 +302,23 @@ end tell
 
 
 # ══════════════════════════════════════════════════════════════
-# Windows 크롬 바로가기 자동 수정
+# 크롬 바로가기 자동 수정
 # ══════════════════════════════════════════════════════════════
 
-def win_patch_chrome_shortcut() -> bool:
-    """
-    Windows에서 크롬 바로가기에 --remote-debugging-port=9222 추가.
-
-    바로가기 경로 탐색 순서:
-      1. 바탕화면 (Desktop)
-      2. 시작 메뉴 (Start Menu)
-      3. 레지스트리에서 크롬 실행 경로 직접 찾기
-
-    .lnk 파일 수정:
-      winreg으로 chrome.exe 경로 확인
-      → 이미 --remote-debugging-port=9222 있으면 스킵
-      → 없으면 기존 Arguments + " --remote-debugging-port=9222"
-
-    반환값: True = 이미 설정됨 또는 설정 성공, False = 실패
-    """
-    if not IS_WIN or not PYWIN32_AVAILABLE:
+def patch_chrome_shortcut() -> bool:
+    if not WINREG_AVAILABLE:
         return False
 
     CDP_FLAG = f"--remote-debugging-port={CDP_PORT}"
-
-    # 크롬 exe 경로 레지스트리에서 읽기
     chrome_exe = None
+
     reg_paths = [
         r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
         r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
     ]
-    for reg_path in reg_paths:
+    for rp in reg_paths:
         try:
-            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_path)
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, rp)
             chrome_exe, _ = winreg.QueryValueEx(key, "")
             winreg.CloseKey(key)
             if chrome_exe:
@@ -624,11 +329,9 @@ def win_patch_chrome_shortcut() -> bool:
     if not chrome_exe or not Path(chrome_exe).exists():
         return False
 
-    # 바로가기 파일 탐색 (.lnk)
-    # CSIDL 경로를 환경변수로 얻기
     shortcut_dirs = [
         Path(os.environ.get("USERPROFILE", "")) / "Desktop",
-        Path(os.environ.get("APPDATA", ""))
+        Path(os.environ.get("APPDATA",     ""))
             / "Microsoft" / "Windows" / "Start Menu" / "Programs",
         Path(os.environ.get("PUBLIC", "")) / "Desktop",
     ]
@@ -638,13 +341,10 @@ def win_patch_chrome_shortcut() -> bool:
         if not d.exists():
             continue
         for lnk in d.rglob("*.lnk"):
-            # 파일 이름에 "chrome" 포함된 것만
             if "chrome" not in lnk.stem.lower():
                 continue
             try:
-                # WScript.Shell로 .lnk 읽기/쓰기
-                # (Python 표준 라이브러리에 .lnk 파서 없음)
-                ps_script = f"""
+                ps = f"""
 $sh = New-Object -ComObject WScript.Shell
 $lnk = $sh.CreateShortcut('{str(lnk)}')
 if ($lnk.Arguments -notlike '*{CDP_FLAG}*') {{
@@ -656,7 +356,7 @@ if ($lnk.Arguments -notlike '*{CDP_FLAG}*') {{
 }}
 """
                 r = subprocess.run(
-                    ["powershell", "-Command", ps_script],
+                    ["powershell", "-Command", ps],
                     capture_output=True, text=True,
                     creationflags=subprocess.CREATE_NO_WINDOW,
                     timeout=10
@@ -912,14 +612,7 @@ class FinishDialog(tk.Toplevel):
 
     def _reboot(self):
         self.destroy()
-        if IS_MAC:
-            subprocess.run(
-                ["osascript", "-e",
-                 'tell application "System Events" to restart'],
-                capture_output=True
-            )
-        elif IS_WIN:
-            subprocess.run(["shutdown", "/r", "/t", "0"])
+        subprocess.run(["shutdown", "/r", "/t", "0"])
 
 
 # ══════════════════════════════════════════════════════════════
@@ -942,7 +635,7 @@ class StudyTimerApp:
         self.root.configure(bg=self.C_BG)
         self.root.resizable(False, False)
 
-        W, H = 460, 580
+        W, H = 460, 560
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         root.geometry(f"{W}x{H}+{(sw-W)//2}+{(sh-H)//2}")
 
@@ -956,26 +649,17 @@ class StudyTimerApp:
         self.running   = False
         self._stop_event = threading.Event()
 
-        # macOS: Cmd+Q 차단
-        if IS_MAC:
-            self.root.createcommand("tk::mac::Quit", self._intercept_quit)
-
-        # Windows: 첫 실행 시 크롬 바로가기 자동 수정
-        if IS_WIN:
-            threading.Thread(
-                target=self._win_setup_chrome,
-                daemon=True
-            ).start()
-
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # 크롬 바로가기 백그라운드 수정
+        threading.Thread(
+            target=self._setup_chrome, daemon=True
+        ).start()
+
         self._build_ui()
 
-    def _win_setup_chrome(self):
-        """
-        백그라운드에서 크롬 바로가기 수정.
-        완료 후 상태 레이블 업데이트.
-        """
-        patched = win_patch_chrome_shortcut()
+    def _setup_chrome(self):
+        patched = patch_chrome_shortcut()
         msg = "크롬 CDP 설정 완료" if patched else "크롬 바로가기 수동 설정 필요"
         self.root.after(0, lambda: self.lbl_status.config(text=msg))
 
@@ -985,10 +669,8 @@ class StudyTimerApp:
         hdr = tk.Frame(self.root, bg=self.C_BG)
         hdr.pack(fill="x", padx=32, pady=(26, 0))
 
-        # OS 배지
-        os_label = "macOS" if IS_MAC else "Windows"
         tk.Label(
-            hdr, text=f"FOCUS  {os_label}",
+            hdr, text="FOCUS  Windows",
             bg=self.C_BG, fg=self.C_ACCENT,
             font=("Courier New", 10, "bold"),
         ).pack(side="left")
@@ -1096,28 +778,32 @@ class StudyTimerApp:
             relief="flat", cursor="hand2",
             font=("Courier New", 12, "bold"),
             pady=12,
-            command=self._toggle,
+            command=self._start,
         )
         self.btn_start.pack(fill="x")
 
         btn_row = tk.Frame(frm, bg=self.C_BG)
         btn_row.pack(fill="x", pady=(7, 0))
 
-        tk.Button(
-            btn_row, text="비상 해제",
-            bg=self.C_DIM, fg=self.C_WARN,
+        self.btn_pause = tk.Button(
+            btn_row, text="일시정지",
+            bg=self.C_DIM, fg=self.C_TEXT,
             relief="flat", cursor="hand2",
             font=("Courier New", 9), pady=8,
-            command=self._emergency_unlock,
-        ).pack(side="left", expand=True, fill="x", padx=(0, 6))
+            state="disabled",
+            command=self._request_pause,
+        )
+        self.btn_pause.pack(side="left", expand=True, fill="x", padx=(0, 6))
 
-        tk.Button(
+        self.btn_reset = tk.Button(
             btn_row, text="초기화",
             bg=self.C_DIM, fg=self.C_SUB,
             relief="flat", cursor="hand2",
             font=("Courier New", 9), pady=8,
-            command=self._reset,
-        ).pack(side="left", expand=True, fill="x")
+            state="disabled",
+            command=self._request_reset,
+        )
+        self.btn_reset.pack(side="left", expand=True, fill="x")
 
     def _build_site_preview(self):
         frm = tk.Frame(self.root, bg=self.C_BG)
@@ -1145,10 +831,9 @@ class StudyTimerApp:
 
     def _set_preset(self, h: int, m: int):
         if not self.running:
-            self.var_h.set(h); self.var_m.set(m); self.var_s.set(0)
-
-    def _toggle(self):
-        self._pause() if self.running else self._start()
+            self.var_h.set(h)
+            self.var_m.set(m)
+            self.var_s.set(0)
 
     def _start(self):
         if self.remaining == 0:
@@ -1158,17 +843,21 @@ class StudyTimerApp:
             if total <= 0:
                 self._flash("시간을 설정하세요", error=True)
                 return
-            self.total = total
+            self.total     = total
             self.remaining = total
 
         self.running = True
         self._stop_event.clear()
 
         self.kiosk.enable()
-        self.app_blocker.start()
-        self.chrome_block.start()
+        if not self.app_blocker._thread or not self.app_blocker._thread.is_alive():
+            self.app_blocker.start()
+        if not self.chrome_block._thread or not self.chrome_block._thread.is_alive():
+            self.chrome_block.start()
 
-        self.btn_start.config(text="일시정지", bg=self.C_DIM, fg=self.C_TEXT)
+        self.btn_start.config(state="disabled", bg=self.C_DIM, fg=self.C_SUB)
+        self.btn_pause.config(state="normal",   fg=self.C_TEXT)
+        self.btn_reset.config(state="normal")
         self.lbl_status.config(
             text="집중 중  |  앱 차단 + 탭 차단 활성화",
             fg=self.C_ACCENT,
@@ -1178,22 +867,46 @@ class StudyTimerApp:
             target=self._countdown, daemon=True, name="Countdown"
         ).start()
 
-    def _pause(self):
+    def _do_pause(self):
         self.running = False
         self._stop_event.set()
         self.kiosk.disable()
         self.app_blocker.stop()
         self.chrome_block.stop()
-        self.btn_start.config(text="재개", bg=self.C_ACCENT, fg="#000")
-        self.lbl_status.config(text="일시정지", fg=self.C_SUB)
+        self.btn_start.config(state="normal", text="재개", bg=self.C_ACCENT, fg="#000")
+        self.btn_pause.config(state="disabled")
+        self.btn_reset.config(state="normal")
+        self.lbl_status.config(text="일시정지  |  차단 해제됨", fg=self.C_SUB)
 
-    def _reset(self):
-        self._pause()
-        self.remaining = 0; self.total = 0
+    def _do_reset(self):
+        self._stop_event.set()
+        self.running   = False
+        self.remaining = 0
+        self.total     = 0
         self.lbl_time.config(text="00:00:00", fg=self.C_TEXT)
-        self.btn_start.config(text="시작", bg=self.C_ACCENT, fg="#000")
-        self.lbl_status.config(text="대기 중", fg=self.C_SUB)
+        self.btn_start.config(state="normal", text="시작", bg=self.C_ACCENT, fg="#000")
+        self.btn_pause.config(state="disabled")
+        self.btn_reset.config(state="disabled")
+        self.lbl_status.config(text="대기 중  |  차단 유지 중", fg=self.C_SUB)
         self._redraw_bar()
+
+    def _request_pause(self):
+        dlg = PasswordDialog(self.root, title="일시정지", prompt="비밀번호를 입력하세요:")
+        if dlg.result is None:
+            return
+        if self.config.check_password(dlg.result):
+            self._do_pause()
+        else:
+            self._flash("비밀번호가 틀렸습니다", error=True)
+
+    def _request_reset(self):
+        dlg = PasswordDialog(self.root, title="초기화", prompt="비밀번호를 입력하세요:")
+        if dlg.result is None:
+            return
+        if self.config.check_password(dlg.result):
+            self._do_reset()
+        else:
+            self._flash("비밀번호가 틀렸습니다", error=True)
 
     def _countdown(self):
         while self.remaining > 0 and not self._stop_event.is_set():
@@ -1213,7 +926,7 @@ class StudyTimerApp:
         self._redraw_bar()
 
     def _redraw_bar(self):
-        w = self.bar.winfo_width()
+        w     = self.bar.winfo_width()
         ratio = 1 - (self.remaining / self.total) if self.total > 0 else 0
         self.bar.coords(self._bar_fill, 0, 0, w * ratio, 3)
 
@@ -1223,49 +936,26 @@ class StudyTimerApp:
         self.app_blocker.stop()
         self.chrome_block.stop()
         self.lbl_time.config(fg=self.C_ACCENT)
-        self.btn_start.config(text="시작", bg=self.C_ACCENT, fg="#000")
+        self.btn_start.config(state="normal", text="시작", bg=self.C_ACCENT, fg="#000")
+        self.btn_pause.config(state="disabled")
+        self.btn_reset.config(state="disabled")
         self.lbl_status.config(text="완료", fg=self.C_ACCENT)
         self._notify()
         FinishDialog(self.root)
 
     def _notify(self):
         try:
-            if IS_MAC:
-                subprocess.run(
-                    ["osascript", "-e",
-                     'display notification "공부 완료" '
-                     'with title "FOCUS Timer" sound name "Glass"'],
-                    capture_output=True, timeout=3
-                )
-            elif IS_WIN:
-                # Windows 토스트 알림 (PowerShell)
-                ps = (
-                    'Add-Type -AssemblyName System.Windows.Forms;'
-                    '[System.Windows.Forms.MessageBox]::Show('
-                    '"공부 완료! 수고했습니다.","FOCUS Timer")'
-                )
-                subprocess.Popen(
-                    ["powershell", "-Command", ps],
-                    creationflags=subprocess.CREATE_NO_WINDOW
-                )
+            ps = (
+                'Add-Type -AssemblyName System.Windows.Forms;'
+                '[System.Windows.Forms.MessageBox]::Show('
+                '"공부 완료! 수고했습니다.","FOCUS Timer")'
+            )
+            subprocess.Popen(
+                ["powershell", "-Command", ps],
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
         except Exception:
             pass
-
-    # ── 비상 해제 ─────────────────────────────────────────────
-
-    def _emergency_unlock(self):
-        dlg = PasswordDialog(self.root, title="비상 해제", prompt="비상 해제 비밀번호:")
-        if dlg.result is None:
-            return
-        if self.config.check_password(dlg.result):
-            self._pause()
-            self.lbl_status.config(
-                text="비상 해제 -- 모든 차단 비활성화", fg=self.C_WARN
-            )
-        else:
-            self._flash("비밀번호가 틀렸습니다", error=True)
-
-    # ── 사이트 관리 ───────────────────────────────────────────
 
     def _open_site_manager(self):
         dlg = PasswordDialog(self.root, title="사이트 관리", prompt="관리자 비밀번호:")
@@ -1277,22 +967,12 @@ class StudyTimerApp:
         else:
             self._flash("비밀번호가 틀렸습니다", error=True)
 
-    # ── Cmd+Q 차단 (macOS) ────────────────────────────────────
-
-    def _intercept_quit(self):
-        if self.running:
-            self._flash("타이머 실행 중에는 종료할 수 없습니다", error=True)
-        else:
-            self._on_close()
-
     def _on_close(self):
         self._stop_event.set()
         self.kiosk.disable()
         self.app_blocker.stop()
         self.chrome_block.stop()
         self.root.destroy()
-
-    # ── 유틸 ──────────────────────────────────────────────────
 
     def _flash(self, msg: str, error: bool = False):
         color = self.C_WARN if error else self.C_ACCENT
@@ -1310,10 +990,6 @@ class StudyTimerApp:
 # ══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    if not IS_MAC and not IS_WIN:
-        print("지원하지 않는 운영체제입니다. macOS 또는 Windows에서 실행하세요.")
-        sys.exit(1)
-
     root = tk.Tk()
     app  = StudyTimerApp(root)
     root.mainloop()
