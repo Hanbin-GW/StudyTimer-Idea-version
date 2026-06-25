@@ -1,7 +1,6 @@
-# StudyTimer-Idea-Concept-Version
-## Focus Timer
+# Focus Timer
 
-macOS 공부 타이머 — 타이머 실행 중 크롬 허용 탭 외 차단 및 앱 강제 종료
+macOS / Windows 공부 타이머 — 타이머 실행 중 크롬 허용 탭 외 차단 및 앱 강제 종료
 
 > **이 버전은 프로토타입 / 컨셉 버전입니다.**  
 > Python으로 제작된 개발 검증용이며, 정식 버전은 C++로 재작성할 예정입니다.
@@ -19,7 +18,9 @@ macOS 공부 타이머 — 타이머 실행 중 크롬 허용 탭 외 차단 및
 
 ## 기능
 
-- 타이머 실행 중 키오스크 모드 (Dock, 메뉴바 숨김 / Cmd+Tab, Spotlight 차단)
+- 타이머 실행 중 키오스크 모드
+  - macOS: Dock, 메뉴바 숨김 / Cmd+Tab, Spotlight, Cmd+Q 차단
+  - Windows: 작업표시줄 숨김 / Win키 차단
 - 크롬 허용 사이트 외 탭 자동 닫기 (5초마다)
 - 크롬 외 모든 앱 강제 종료 (3초마다)
 - 비상 해제 — 비밀번호 입력 시 모든 차단 해제 + 타이머 일시정지
@@ -31,12 +32,18 @@ macOS 공부 타이머 — 타이머 실행 중 크롬 허용 탭 외 차단 및
 
 ## 요구사항
 
-- macOS
+### 공통
 - Python 3.10 이상
-- pyobjc (키오스크 모드용)
 
+### macOS
 ```bash
 pip install pyobjc-framework-Cocoa
+```
+
+### Windows
+```bash
+pip install pywin32
+pip install requests
 ```
 
 ---
@@ -45,8 +52,26 @@ pip install pyobjc-framework-Cocoa
 
 > 앱 차단 기능은 관리자 권한이 필요합니다.
 
+**macOS**
 ```bash
 sudo python3 study_timer.py
+```
+
+**Windows** (관리자 권한으로 실행한 터미널에서)
+```bash
+python study_timer.py
+```
+
+---
+
+## Windows 크롬 설정
+
+Windows에서 크롬 탭 차단은 CDP(Chrome DevTools Protocol)를 사용합니다.  
+앱 첫 실행 시 크롬 바로가기에 `--remote-debugging-port=9222` 옵션이 **자동으로 추가**됩니다.
+
+자동 설정이 실패한 경우 크롬 바로가기 속성에서 직접 추가하세요:
+```
+"C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
 ```
 
 ---
@@ -85,9 +110,15 @@ python3 -c "import hashlib; print(hashlib.sha256('YOUR_PASSWORD'.encode()).hexdi
 
 타이머 실행 중 아래 앱만 유지됩니다. 그 외는 강제 종료됩니다.
 
+**macOS**
 - Google Chrome
 - Terminal / iTerm2
 - 시스템 필수 프로세스 (WindowServer, Dock 등)
+
+**Windows**
+- chrome.exe
+- cmd.exe / powershell.exe / WindowsTerminal.exe
+- 시스템 필수 프로세스 (explorer.exe, dwm.exe 등)
 
 ---
 
@@ -95,4 +126,5 @@ python3 -c "import hashlib; print(hashlib.sha256('YOUR_PASSWORD'.encode()).hexdi
 
 - 타이머 시작 전 작업 중인 파일을 반드시 저장하세요.
 - 비상 해제 비밀번호를 잊어버리면 `config.json`을 삭제 후 재실행하면 초기화됩니다.
-- Finder는 macOS 필수 프로세스로 차단되지 않습니다.
+- macOS: Finder는 시스템 필수 프로세스로 차단되지 않습니다.
+- Windows: explorer.exe는 시스템 필수 프로세스로 차단되지 않습니다.
