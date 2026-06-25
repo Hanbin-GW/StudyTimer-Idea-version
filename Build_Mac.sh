@@ -1,0 +1,1 @@
+pyinstaller --onefile --noconsole study_timer.py
