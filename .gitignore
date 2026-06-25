@@ -5,3 +5,4 @@ password_generator.py
 /build
 /dist
 *.spec
+/dev

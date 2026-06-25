@@ -56,18 +56,22 @@ DEFAULT_SITES = [
 
 DEFAULT_PW_HASH = hashlib.sha256("1234".encode()).hexdigest()
 
-SYSTEM_PROCESSES = {
+# 항상 허용 — 절대 건드리면 안 되는 앱
+ALWAYS_ALLOWED = {
+    "Google Chrome",
+    "Terminal",
+    "iTerm2",
     "loginwindow", "WindowServer", "Dock", "SystemUIServer",
     "ControlCenter", "NotificationCenter", "Spotlight",
     "universalaccessd", "coreaudiod", "AirPlayUIAgent",
     "UserNotificationCenter", "Python", "python3", "osascript",
 }
 
-ALLOWED_APPS = {
-    "Google Chrome",
-    "Terminal",
-    "iTerm2",
-} | SYSTEM_PROCESSES
+# .app으로 빌드됐을 때 자기 자신의 프로세스 이름을 동적으로 추가
+# pyinstaller --windowed 빌드 시 프로세스 이름 = 앱 이름 (예: study_timer_mac)
+_own_proc_name = Path(sys.executable).stem  # 실행 파일 이름 (확장자 제외)
+ALWAYS_ALLOWED.add(_own_proc_name)
+ALWAYS_ALLOWED.add(_own_proc_name.lower())
 
 
 # ══════════════════════════════════════════════════════════════
@@ -118,36 +122,40 @@ class ConfigManager:
 # ══════════════════════════════════════════════════════════════
 
 class KioskMode:
+    # pyobjc는 메인 스레드 요구사항이 까다로워서 AppleScript 방식으로 통일
+    # AppleScript: osascript 명령어로 macOS System Events 직접 제어
+
+    # 키오스크 모드 ON 스크립트
+    _ENABLE_SCRIPT = '''
+tell application "System Events"
+    tell dock preferences to set autohide to true
+end tell
+tell application "System Events"
+    set frontmost of process "Dock" to false
+end tell
+'''
+
+    # 키오스크 모드 OFF 스크립트
+    _DISABLE_SCRIPT = '''
+tell application "System Events"
+    tell dock preferences to set autohide to false
+end tell
+'''
+
+    def _run(self, script: str):
+        try:
+            subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, timeout=8
+            )
+        except Exception:
+            pass
 
     def enable(self):
-        if PYOBJC_AVAILABLE:
-            options = (
-                NSApplicationPresentationHideDock                |
-                NSApplicationPresentationHideMenuBar             |
-                NSApplicationPresentationDisableAppleMenu        |
-                NSApplicationPresentationDisableProcessSwitching |
-                NSApplicationPresentationDisableForceQuit        |
-                NSApplicationPresentationDisableSessionTermination
-            )
-            NSApp.setPresentationOptions_(options)
-        else:
-            subprocess.run(
-                ["osascript", "-e",
-                 'tell application "System Events" to tell dock preferences'
-                 ' to set autohide to true'],
-                capture_output=True, timeout=5
-            )
+        self._run(self._ENABLE_SCRIPT)
 
     def disable(self):
-        if PYOBJC_AVAILABLE:
-            NSApp.setPresentationOptions_(0)
-        else:
-            subprocess.run(
-                ["osascript", "-e",
-                 'tell application "System Events" to tell dock preferences'
-                 ' to set autohide to false'],
-                capture_output=True, timeout=5
-            )
+        self._run(self._DISABLE_SCRIPT)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -155,12 +163,26 @@ class KioskMode:
 # ══════════════════════════════════════════════════════════════
 
 class AppBlocker:
+    """
+    스냅샷 방식 앱 차단기.
+
+    타이머 시작 시점에 실행 중인 앱 목록을 스냅샷으로 저장.
+    스냅샷 앱 + ALWAYS_ALLOWED 앱은 허용.
+    타이머 시작 후 새로 실행된 앱만 차단.
+
+    예시:
+      타이머 시작 전: Finder, 메일, 캘린더 열려있음
+        → 스냅샷에 자동 추가 → 보호됨
+      타이머 시작 후: Steam 실행
+        → 스냅샷에 없음 → 차단
+    """
 
     POLL_INTERVAL = 3
 
     def __init__(self):
-        self._stop_event = threading.Event()
+        self._stop_event  = threading.Event()
         self._thread: threading.Thread | None = None
+        self._snapshot: set[str] = set()  # 타이머 시작 시점 앱 목록
 
     def _get_running_apps(self) -> list[str]:
         script = """
@@ -179,6 +201,10 @@ class AppBlocker:
         except Exception:
             return []
 
+    def _take_snapshot(self):
+        """타이머 시작 시점 앱 목록 저장"""
+        self._snapshot = set(self._get_running_apps())
+
     def _kill_app(self, app_name: str):
         try:
             subprocess.run(
@@ -195,11 +221,15 @@ class AppBlocker:
     def _loop(self):
         while not self._stop_event.is_set():
             for app in self._get_running_apps():
-                if app not in ALLOWED_APPS:
-                    self._kill_app(app)
+                # ALWAYS_ALLOWED 또는 스냅샷에 있으면 허용
+                if app in ALWAYS_ALLOWED or app in self._snapshot:
+                    continue
+                self._kill_app(app)
             self._stop_event.wait(self.POLL_INTERVAL)
 
     def start(self):
+        # 시작 전 현재 앱 목록 스냅샷 찍기
+        self._take_snapshot()
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._loop, daemon=True, name="AppBlocker"
@@ -757,7 +787,7 @@ class StudyTimerApp:
 
         self.kiosk.enable()
         if not self.app_blocker._thread or not self.app_blocker._thread.is_alive():
-            self.app_blocker.start()
+            self.app_blocker.start()  # 스냅샷 찍고 시작
         if not self.chrome_block._thread or not self.chrome_block._thread.is_alive():
             self.chrome_block.start()
 
@@ -786,11 +816,12 @@ class StudyTimerApp:
         self.lbl_status.config(text="일시정지  |  차단 해제됨", fg=self.C_SUB)
 
     def _do_reset(self):
-        """실제 초기화 — 타이머만 리셋, 차단 유지"""
+        """초기화 — 타이머 리셋 + Dock 복구 (차단은 유지)"""
         self._stop_event.set()
         self.running   = False
         self.remaining = 0
         self.total     = 0
+        self.kiosk.disable()   # Dock 복구
         self.lbl_time.config(text="00:00:00", fg=self.C_TEXT)
         self.btn_start.config(state="normal", text="시작", bg=self.C_ACCENT, fg="#000")
         self.btn_pause.config(state="disabled")
@@ -799,14 +830,8 @@ class StudyTimerApp:
         self._redraw_bar()
 
     def _request_pause(self):
-        """일시정지 — 비밀번호 확인 후 실행"""
-        dlg = PasswordDialog(self.root, title="일시정지", prompt="비밀번호를 입력하세요:")
-        if dlg.result is None:
-            return
-        if self.config.check_password(dlg.result):
-            self._do_pause()
-        else:
-            self._flash("비밀번호가 틀렸습니다", error=True)
+        """일시정지 — 비밀번호 없이 바로 실행"""
+        self._do_pause()
 
     def _request_reset(self):
         """초기화 — 비밀번호 확인 후 실행 (차단 유지)"""
@@ -836,7 +861,12 @@ class StudyTimerApp:
         self._redraw_bar()
 
     def _redraw_bar(self):
-        w     = self.bar.winfo_width()
+        w = self.bar.winfo_width()
+        if w <= 1:
+            self.root.update_idletasks()
+            w = self.bar.winfo_width()
+        if w <= 1:
+            return
         ratio = 1 - (self.remaining / self.total) if self.total > 0 else 0
         self.bar.coords(self._bar_fill, 0, 0, w * ratio, 3)
 

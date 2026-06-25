@@ -60,6 +60,7 @@ DEFAULT_PW_HASH = hashlib.sha256("1234".encode()).hexdigest()
 
 WIN_SYSTEM_PROCESSES = {
     "explorer.exe", "python.exe", "python3.exe", "pythonw.exe",
+    "python3.12.exe", "python3.11.exe", "python3.10.exe",
     "cmd.exe", "powershell.exe", "windowsterminal.exe", "conhost.exe",
     "csrss.exe", "wininit.exe", "winlogon.exe", "services.exe",
     "lsass.exe", "svchost.exe", "dwm.exe", "taskmgr.exe",
@@ -70,9 +71,14 @@ WIN_SYSTEM_PROCESSES = {
     "textinputhost.exe", "searchapp.exe", "lockapp.exe",
 }
 
-WIN_ALLOWED_PROCS = {
+WIN_ALWAYS_ALLOWED = {
     "chrome.exe",
 } | WIN_SYSTEM_PROCESSES
+
+# .exe로 빌드됐을 때 자기 자신의 프로세스 이름을 동적으로 추가
+# pyinstaller 빌드 시 프로세스 이름 = 빌드된 exe 이름 (예: study_timer_windows.exe)
+_own_proc_name = Path(sys.executable).name.lower()  # 예: study_timer_windows.exe
+WIN_ALWAYS_ALLOWED.add(_own_proc_name)
 
 CDP_PORT = 9222
 
@@ -197,14 +203,21 @@ class KioskMode:
 # ══════════════════════════════════════════════════════════════
 
 class AppBlocker:
+    """
+    스냅샷 방식 앱 차단기.
+    타이머 시작 시점 프로세스 목록을 스냅샷으로 저장.
+    스냅샷 + WIN_ALWAYS_ALLOWED 에 없는 새 프로세스만 차단.
+    """
 
     POLL_INTERVAL = 3
 
     def __init__(self):
-        self._stop_event = threading.Event()
+        self._stop_event  = threading.Event()
         self._thread: threading.Thread | None = None
+        self._own_pid     = os.getpid()
+        self._snapshot: set[str] = set()
 
-    def _get_procs(self) -> list[str]:
+    def _get_procs(self) -> list[tuple[str, int]]:
         try:
             r = subprocess.run(
                 ["tasklist", "/FO", "CSV", "/NH"],
@@ -214,12 +227,24 @@ class AppBlocker:
             procs = []
             for line in r.stdout.strip().splitlines():
                 line = line.strip()
-                if line:
-                    name = line.split(",")[0].strip('"').lower()
-                    procs.append(name)
+                if not line:
+                    continue
+                parts = line.split(",")
+                if len(parts) < 2:
+                    continue
+                name = parts[0].strip(chr(34)).lower()
+                try:
+                    pid = int(parts[1].strip(chr(34)))
+                except ValueError:
+                    pid = -1
+                procs.append((name, pid))
             return procs
         except Exception:
             return []
+
+    def _take_snapshot(self):
+        """타이머 시작 시점 프로세스 스냅샷 저장"""
+        self._snapshot = {name for name, _ in self._get_procs()}
 
     def _kill(self, proc_name: str):
         try:
@@ -233,12 +258,16 @@ class AppBlocker:
 
     def _loop(self):
         while not self._stop_event.is_set():
-            for proc in self._get_procs():
-                if proc not in WIN_ALLOWED_PROCS:
-                    self._kill(proc)
+            for name, pid in self._get_procs():
+                if pid == self._own_pid:
+                    continue
+                if name in WIN_ALWAYS_ALLOWED or name in self._snapshot:
+                    continue
+                self._kill(name)
             self._stop_event.wait(self.POLL_INTERVAL)
 
     def start(self):
+        self._take_snapshot()
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._loop, daemon=True, name="AppBlocker"
@@ -641,7 +670,6 @@ class StudyTimerApp:
 
         self.config       = ConfigManager()
         self.kiosk        = KioskMode()
-        self.app_blocker  = AppBlocker()
         self.chrome_block = ChromeBlocker(self.config)
 
         self.remaining = 0
@@ -850,8 +878,6 @@ class StudyTimerApp:
         self._stop_event.clear()
 
         self.kiosk.enable()
-        if not self.app_blocker._thread or not self.app_blocker._thread.is_alive():
-            self.app_blocker.start()
         if not self.chrome_block._thread or not self.chrome_block._thread.is_alive():
             self.chrome_block.start()
 
@@ -871,7 +897,6 @@ class StudyTimerApp:
         self.running = False
         self._stop_event.set()
         self.kiosk.disable()
-        self.app_blocker.stop()
         self.chrome_block.stop()
         self.btn_start.config(state="normal", text="재개", bg=self.C_ACCENT, fg="#000")
         self.btn_pause.config(state="disabled")
@@ -879,10 +904,12 @@ class StudyTimerApp:
         self.lbl_status.config(text="일시정지  |  차단 해제됨", fg=self.C_SUB)
 
     def _do_reset(self):
+        """초기화 — 타이머 리셋 + 작업표시줄 복구 (차단은 유지)"""
         self._stop_event.set()
         self.running   = False
         self.remaining = 0
         self.total     = 0
+        self.kiosk.disable()   # 작업표시줄 복구
         self.lbl_time.config(text="00:00:00", fg=self.C_TEXT)
         self.btn_start.config(state="normal", text="시작", bg=self.C_ACCENT, fg="#000")
         self.btn_pause.config(state="disabled")
@@ -891,13 +918,8 @@ class StudyTimerApp:
         self._redraw_bar()
 
     def _request_pause(self):
-        dlg = PasswordDialog(self.root, title="일시정지", prompt="비밀번호를 입력하세요:")
-        if dlg.result is None:
-            return
-        if self.config.check_password(dlg.result):
-            self._do_pause()
-        else:
-            self._flash("비밀번호가 틀렸습니다", error=True)
+        """일시정지 — 비밀번호 없이 바로 실행"""
+        self._do_pause()
 
     def _request_reset(self):
         dlg = PasswordDialog(self.root, title="초기화", prompt="비밀번호를 입력하세요:")
@@ -926,14 +948,18 @@ class StudyTimerApp:
         self._redraw_bar()
 
     def _redraw_bar(self):
-        w     = self.bar.winfo_width()
+        w = self.bar.winfo_width()
+        if w <= 1:
+            self.root.update_idletasks()
+            w = self.bar.winfo_width()
+        if w <= 1:
+            return
         ratio = 1 - (self.remaining / self.total) if self.total > 0 else 0
         self.bar.coords(self._bar_fill, 0, 0, w * ratio, 3)
 
     def _on_finish(self):
         self.running = False
         self.kiosk.disable()
-        self.app_blocker.stop()
         self.chrome_block.stop()
         self.lbl_time.config(fg=self.C_ACCENT)
         self.btn_start.config(state="normal", text="시작", bg=self.C_ACCENT, fg="#000")
@@ -970,7 +996,6 @@ class StudyTimerApp:
     def _on_close(self):
         self._stop_event.set()
         self.kiosk.disable()
-        self.app_blocker.stop()
         self.chrome_block.stop()
         self.root.destroy()
 

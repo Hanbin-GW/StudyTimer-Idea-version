@@ -1,1 +1,1 @@
-pyinstaller --onefile --noconsole --icon=clock.icns study_timer.py
+pyinstaller --onefile --noconsole --icon=icon/clock.icns study_timer.py
